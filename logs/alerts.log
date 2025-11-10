@@ -1,0 +1,1 @@
+2025-11-09T23:02:24.882077+00:00 | Pipeline delay detected. Latest bronze event: None | metrics_snapshot=s3://gold/dashboards/pipeline_metrics.json
