@@ -24,7 +24,7 @@ def comprehensive_quality_checks(files: List[str]) -> Dict[str, int]:
 
 @task(name="calculate_quality_scores")
 def calculate_quality_scores(files: List[str]) -> Dict[str, object]:
-    staging_path, metrics = quality.score_dataset(files)
+    staging_path, metrics = quality.score_dataset(files, required_source_type="realtime")
     return {"staging_path": staging_path, "metrics": metrics}
 
 
@@ -57,16 +57,20 @@ def bike_realtime_quality(window_minutes: int = 15) -> Dict[str, object]:
     metrics = payload.get("metrics", {})
     if not metrics.get("records"):
         logger.info("No hay datos nuevos para procesar")
-        return {"status": "empty", "metrics": metrics, "checks": checks}
+        result = {"status": "empty", "metrics": metrics, "checks": checks}
+        monitoring.record_flow_status("bike_realtime_quality", result)
+        return result
 
     if not quality_gate(metrics):
         logger.warning("El control de calidad detuvo la promoción: %s", metrics)
-        return {"status": "blocked", "metrics": metrics, "checks": checks}
+        result = {"status": "blocked", "metrics": metrics, "checks": checks}
+        monitoring.record_flow_status("bike_realtime_quality", result)
+        return result
 
     silver_path = move_to_silver(payload.get("staging_path"))
     gold_outputs = update_analytical_tables(silver_path)
     report_path = generate_quality_report(metrics)
-    return {
+    result = {
         "status": "completed",
         "metrics": metrics,
         "checks": checks,
@@ -74,6 +78,8 @@ def bike_realtime_quality(window_minutes: int = 15) -> Dict[str, object]:
         "gold_outputs": gold_outputs,
         "report_path": report_path,
     }
+    monitoring.record_flow_status("bike_realtime_quality", result)
+    return result
 
 
 # -------- Historical Batch Flow -------- #
@@ -99,10 +105,12 @@ def bike_batch_historical() -> Dict[str, object]:
     payload = validate_historical_data()
     bronze_files = load_to_bronze(payload.get("valid_files", []))
     result = process_to_silver(bronze_files)
-    return {
+    flow_payload = {
         "validation": payload,
         "result": result,
     }
+    monitoring.record_flow_status("bike_batch_historical", flow_payload)
+    return flow_payload
 
 
 # -------- Monitoring Flow -------- #
@@ -114,21 +122,30 @@ def check_system_health() -> Dict[str, object]:
 
 
 @task(name="generate_observability_metrics")
-def generate_observability_metrics() -> str:
+def generate_observability_metrics() -> Dict[str, object]:
     return monitoring.generate_observability_metrics()
 
 
 @task(name="send_alerts_if_needed")
-def send_alerts_if_needed(health: Dict[str, object], metrics_path: str) -> None:
-    monitoring.send_alerts_if_needed(health, metrics_path)
+def send_alerts_if_needed(health: Dict[str, object], metrics_snapshot: Dict[str, object]) -> None:
+    monitoring.send_alerts_if_needed(health, metrics_snapshot)
 
 
 @flow(name="bike_system_monitoring")
 def bike_system_monitoring() -> Dict[str, object]:
     health = check_system_health()
-    metrics_path = generate_observability_metrics()
-    send_alerts_if_needed(health, metrics_path)
-    return {"health": health, "metrics_path": metrics_path}
+    metrics_snapshot = generate_observability_metrics()
+    send_alerts_if_needed(health, metrics_snapshot)
+    monitoring.record_flow_status(
+        "bike_system_monitoring",
+        {
+            "status": "completed",
+            "health": health,
+            "metrics": metrics_snapshot.get("payload"),
+            "metrics_path": metrics_snapshot.get("path"),
+        },
+    )
+    return {"health": health, "metrics_path": metrics_snapshot.get("path")}
 
 
 if __name__ == "__main__":  # pragma: no cover

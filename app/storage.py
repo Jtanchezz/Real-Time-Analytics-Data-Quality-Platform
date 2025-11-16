@@ -53,6 +53,7 @@ class BronzeWriter:
         event_payload = {
             **event_payload,
             "ingested_at": datetime.now(timezone.utc).isoformat(),
+            "source_type": "realtime",
         }
         table = pa.Table.from_pylist([event_payload])
         parquet_name = f"event_{uuid.uuid4().hex}.parquet"

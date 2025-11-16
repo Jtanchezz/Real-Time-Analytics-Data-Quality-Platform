@@ -57,7 +57,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 `reference/stations_reference.csv` permanece local y alimenta las reglas de velocidad.
 
 ## 4. Marco de calidad
-`Quality_Score = max(0, 100 - Deductions)` con bandas: ≥90 EXCELLENT, 75-89 GOOD, 60-74 FAIR, <60 POOR.
+`Base_Score = 100` y `Quality_Score = max(0, (Base_Score - Deductions) / Base_Score)`. El score se almacena normalizado (0-1) y las bandas se calculan sobre el porcentaje equivalente (90-100 = EXCELLENT, 75-89 = GOOD, 60-74 = FAIR, <60 = POOR). Las deducciones se agrupan y limitan por categoría: Schema & Completeness ≤40, Data Validity ≤40, Business Logic ≤20. Para cada registro también se persistente `schema_penalty`, `validity_penalty`, `business_penalty` y `deductions` totales para facilitar los dashboards de calidad.
 
 | Categoría | Regla | Penalidad |
 |-----------|-------|-----------|
@@ -78,8 +78,14 @@ Los resultados se escriben directamente en S3: `s3://silver/date=.../hour=.../si
 `prefect_flows/bike_data_platform.py` define los tres flujos principales:
 
 1. **`bike_realtime_quality`** (cada 10 min): `check_new_realtime_data → comprehensive_quality_checks → calculate_quality_scores → quality_gate → move_to_silver → update_analytical_tables → generate_quality_report`.
-2. **`bike_batch_historical`** (diario): `validate_historical_data → load_to_bronze → process_to_silver`.
+   - Usa un checkpoint en `gold/control/realtime_checkpoint.json` para leer sólo archivos nuevos de Bronze (`source_type="realtime"`).
+   - La promoción a Silver añade `quality_score`, `quality_band`, `deductions` y la descomposición por categoría antes de actualizar las tablas de Gold.
+2. **`bike_batch_historical`** (diario 00:00 UTC): `validate_historical_data → load_to_bronze → process_to_silver`.
+   - `validate_historical_data` descarga automáticamente los archivos de https://s3.amazonaws.com/tripdata/index.html filtrando los que empiezan con `20` (ignora `JC*`), expande zips anidados, quita basura (`.DS_Store`, `__MACOSX`, etc.) y genera lotes Parquet en `s3://historical/pending/archive=...`.
+- `load_to_bronze` normaliza los CSV (campos requeridos, `source_type="historical"`) y los escribe particionados por fecha/hora bajo `s3://bronze/historical/...` antes de promoverlos a Silver/Gold con los mismos checks que realtime.
+- Se puede limitar la descarga a años específicos seteando `APP_HISTORICAL_YEARS="2019,2020"` antes de correr el flow (útil para probar).
 3. **`bike_system_monitoring`** (cada hora): `check_system_health → generate_observability_metrics → send_alerts_if_needed`.
+   - Produce `s3://gold/dashboards/pipeline_metrics.json` + `s3://gold/dashboards/flow_status/*.json` y dispara alertas cuando la API cae, >20 % de registros quedan en banda POOR o un flow falla/se retrasa.
 
 ### Ejecución ad-hoc
 ```bash
@@ -101,8 +107,11 @@ prefect agent start -q default
 
 ## 6. Observabilidad
 - **Ingesta:** `/api/v1/metrics` puede exponerse vía Prometheus/Grafana.
-- **Calidad:** Usa `s3://gold/quality_trends.parquet` + los reportes de `s3://gold/reports/`.
-- **Salud del pipeline:** `monitoring.generate_observability_metrics()` escribe `s3://gold/dashboards/pipeline_metrics.json`. Las alertas siguen en `logs/alerts.log` (útil para reenviar a Slack/Email).
+- **Calidad:** Usa `s3://gold/quality_trends.parquet`, `s3://silver/...` (columnas de penalizaciones) y los reportes `s3://gold/reports/quality_report_*.json`.
+- **Salud del pipeline:** `monitoring.generate_observability_metrics()` escribe `s3://gold/dashboards/pipeline_metrics.json` y `s3://gold/dashboards/flow_status/*.json`.
+- **Alertas:** `monitoring.send_alerts_if_needed` deja un rastro en `logs/alerts.log` cuando la API se cae, hay >20 % de registros en banda “POOR” o algún flow está bloqueado/fallido.
+- **Dashboards de referencia:** ver `docs/dashboards/observability.md` para la arquitectura de paneles y las fuentes exactas.
+- **Dashboard rápido en Streamlit:** ejecutar `streamlit run apps/streamlit_dashboard.py` (usa las mismas variables de entorno de MinIO/Prefect para leer los buckets de Gold/Silver).
 
 ## 7. Validaciones rápidas
 ```bash
@@ -112,14 +121,15 @@ from app.main import app
 client = TestClient(app)
 payload = {
     "trip_id": "abc123",
-    "bike_id": "12345",
+    "bike_id": 12345,
     "start_time": "2024-01-15T08:30:00Z",
     "end_time": "2024-01-15T09:15:00Z",
-    "start_station_id": 123,
-    "end_station_id": 456,
+    "start_station_id": 123.0,
+    "end_station_id": 456.0,
     "rider_age": 28,
     "trip_duration": 2700,
-    "bike_type": "electric"
+    "bike_type": "electric",
+    "member_casual": "member"
 }
 print(client.post("/api/v1/trips", json=payload).json())
 print(client.get("/api/v1/metrics").json())

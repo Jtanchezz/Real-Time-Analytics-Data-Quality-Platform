@@ -9,3 +9,4 @@ boto3==1.34.130
 s3fs==2024.6.0
 prefect==2.20.9
 httpx==0.27.0
+streamlit==1.37.1

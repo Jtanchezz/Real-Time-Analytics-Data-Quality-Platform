@@ -29,31 +29,97 @@ REQUIRED_FIELDS = [
     "rider_age",
     "trip_duration",
     "bike_type",
+    "member_casual",
 ]
-ALLOWED_FIELDS = REQUIRED_FIELDS + ["ingested_at"]
+ALLOWED_FIELDS = REQUIRED_FIELDS + ["ingested_at", "source_type"]
 MAX_SPEED_KMH = 30
 MIN_TRIP_DURATION = 60
 MAX_TRIP_DURATION = 86_400  # 24 hours
+REALTIME_CHECKPOINT_KEY = "control/realtime_checkpoint.json"
+SCHEMA_MAX_DEDUCTION = 40
+VALIDITY_MAX_DEDUCTION = 40
+BUSINESS_MAX_DEDUCTION = 20
+STRING_FIELDS = {"trip_id", "bike_type", "member_casual"}
+NUMERIC_FIELDS = {
+    "bike_id",
+    "start_station_id",
+    "end_station_id",
+    "rider_age",
+    "trip_duration",
+}
+DATETIME_FIELDS = {"start_time", "end_time"}
 
 STORAGE_SETTINGS = get_storage_settings()
 S3_CLIENT = get_s3_client()
 S3_FS = get_s3_fs()
 S3_OPTIONS = STORAGE_SETTINGS.storage_options()
 STATION_LOOKUP_PATH = REFERENCE_DIR / "stations_reference.csv"
+REALTIME_CHECKPOINT_URI = s3_uri(STORAGE_SETTINGS.gold_bucket, REALTIME_CHECKPOINT_KEY)
+
+
+def _load_realtime_checkpoint() -> Tuple[Optional[datetime], str]:
+    try:
+        with S3_FS.open(REALTIME_CHECKPOINT_URI, "r") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return None, ""
+    except Exception:
+        return None, ""
+    timestamp = payload.get("last_modified")
+    last_key = payload.get("last_key", "")
+    if not timestamp:
+        return None, last_key
+    try:
+        last_modified = datetime.fromisoformat(timestamp)
+        if last_modified.tzinfo is None:
+            last_modified = last_modified.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None, last_key
+    return last_modified, last_key
+
+
+def _persist_realtime_checkpoint(last_modified: datetime, last_key: str) -> None:
+    if last_modified.tzinfo is None:
+        last_modified = last_modified.replace(tzinfo=timezone.utc)
+    payload = {
+        "last_modified": last_modified.isoformat(),
+        "last_key": last_key,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with S3_FS.open(REALTIME_CHECKPOINT_URI, "w") as handle:
+        json.dump(payload, handle)
 
 
 def discover_new_data(window_minutes: int = 15) -> List[str]:
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+    checkpoint_time, checkpoint_key = _load_realtime_checkpoint()
+    lookback_cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
     paginator = S3_CLIENT.get_paginator("list_objects_v2")
-    files: List[str] = []
+    discovered: List[Tuple[datetime, str]] = []
     for page in paginator.paginate(Bucket=STORAGE_SETTINGS.bronze_bucket):
         for obj in page.get("Contents", []):
-            if not obj["Key"].endswith(".parquet"):
+            key = obj["Key"]
+            if not key.endswith(".parquet") or key.startswith("historical/"):
                 continue
             modified = obj["LastModified"].astimezone(timezone.utc)
-            if modified >= cutoff:
-                files.append(s3_uri(STORAGE_SETTINGS.bronze_bucket, obj["Key"]))
-    return sorted(files)
+            is_new = False
+            if checkpoint_time:
+                is_new = modified > checkpoint_time or (
+                    modified == checkpoint_time and key > checkpoint_key
+                )
+            else:
+                is_new = True
+            if is_new:
+                discovered.append((modified, key))
+
+    discovered.sort(key=lambda item: (item[0], item[1]))
+    files = [
+        s3_uri(STORAGE_SETTINGS.bronze_bucket, key)
+        for _, key in discovered
+    ]
+    if discovered:
+        latest_modified, latest_key = discovered[-1]
+        _persist_realtime_checkpoint(latest_modified, latest_key)
+    return files
 
 
 def _load_station_lookup() -> Dict[int, Tuple[float, float]]:
@@ -76,6 +142,42 @@ def _load_frames(files: List[str]) -> DataFrame:
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
+
+
+def _is_missing(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
+def _parse_datetime(value) -> Tuple[Optional[pd.Timestamp], bool]:
+    if _is_missing(value):
+        return None, False
+    try:
+        parsed = pd.to_datetime(value, utc=True)
+    except Exception:
+        return None, True
+    return parsed, False
+
+
+def _coerce_number(value) -> Tuple[Optional[float], bool]:
+    if _is_missing(value):
+        return None, False
+    try:
+        coerced = float(value)
+    except (TypeError, ValueError):
+        return None, True
+    return coerced, False
+
+
+def _require_string(value) -> bool:
+    if _is_missing(value):
+        return False
+    return not isinstance(value, str)
 
 
 def run_comprehensive_checks(files: List[str]) -> Dict[str, int]:
@@ -152,106 +254,181 @@ def _score_band(score: float) -> str:
     return "POOR"
 
 
-def score_dataset(files: List[str]) -> Tuple[Optional[str], Dict[str, float]]:
+def score_dataset(
+    files: List[str], required_source_type: Optional[str] = None
+) -> Tuple[Optional[str], Dict[str, float]]:
     df = _load_frames(files)
     if df.empty:
-        return None, {"records": 0, "quality_pass_rate": 0.0}
+        return None, {"records": 0, "quality_pass_rate": 0.0, "poor_share": 0.0}
+
+    if required_source_type:
+        if "source_type" not in df.columns:
+            df["source_type"] = required_source_type
+        mask = (
+            df["source_type"]
+            .fillna("")
+            .str.lower()
+            .eq(required_source_type.lower())
+        )
+        df = df.loc[mask].reset_index(drop=True)
+        if df.empty:
+            return None, {"records": 0, "quality_pass_rate": 0.0, "poor_share": 0.0}
 
     stations = _load_station_lookup()
 
-    def _score_row(row: pd.Series) -> Tuple[float, float, str]:
-        deductions = 0
-        missing_fields = [f for f in REQUIRED_FIELDS if pd.isna(row.get(f))]
-        deductions += 10 * len(missing_fields)
+    def _score_row(row: pd.Series) -> Tuple[float, float, str, float, float, float]:
+        schema_penalty = 0.0
+        validity_penalty = 0.0
+        business_penalty = 0.0
 
-        invalid_type_fields = []
-        if row.get("rider_age") is not None and not pd.isna(row.get("rider_age")):
-            try:
-                int(row.get("rider_age"))
-            except (TypeError, ValueError):
-                invalid_type_fields.append("rider_age")
-        numeric_fields = ["start_station_id", "end_station_id", "trip_duration"]
-        for field in numeric_fields:
+        missing_fields = [field for field in REQUIRED_FIELDS if _is_missing(row.get(field))]
+        schema_penalty += 10 * len(missing_fields)
+
+        start_dt: Optional[pd.Timestamp] = None
+        end_dt: Optional[pd.Timestamp] = None
+        duration_value: Optional[float] = None
+        rider_age_value: Optional[float] = None
+        start_station_value: Optional[float] = None
+        end_station_value: Optional[float] = None
+
+        invalid_fields: List[str] = []
+        for field in REQUIRED_FIELDS:
+            if field in missing_fields:
+                continue
             value = row.get(field)
-            if value is not None and pd.isna(value):
-                invalid_type_fields.append(field)
-        deductions += 5 * len(invalid_type_fields)
+            if field in STRING_FIELDS:
+                if _require_string(value):
+                    invalid_fields.append(field)
+            elif field in DATETIME_FIELDS:
+                parsed, invalid = _parse_datetime(value)
+                if invalid:
+                    invalid_fields.append(field)
+                if field == "start_time":
+                    start_dt = parsed
+                else:
+                    end_dt = parsed
+            elif field in NUMERIC_FIELDS:
+                coerced, invalid = _coerce_number(value)
+                if invalid:
+                    invalid_fields.append(field)
+                if field == "trip_duration":
+                    duration_value = coerced
+                elif field == "rider_age":
+                    rider_age_value = coerced
+                elif field == "start_station_id":
+                    start_station_value = coerced
+                elif field == "end_station_id":
+                    end_station_value = coerced
+        schema_penalty += 5 * len(invalid_fields)
 
         unexpected_fields = [field for field in row.index if field not in ALLOWED_FIELDS]
-        deductions += 2 * len(unexpected_fields)
+        schema_penalty += 2 * len(unexpected_fields)
+        schema_penalty = min(schema_penalty, SCHEMA_MAX_DEDUCTION)
 
-        try:
-            start = pd.to_datetime(row.get("start_time"), utc=True)
-            end = pd.to_datetime(row.get("end_time"), utc=True)
-        except Exception:
-            start = end = None
-            deductions += 5
+        if start_dt is not None and end_dt is not None:
+            if start_dt >= end_dt:
+                validity_penalty += 25
+            duration_delta = (end_dt - start_dt).total_seconds()
+            if duration_value is None:
+                duration_value = duration_delta
+            else:
+                if abs(duration_delta - duration_value) > 60:
+                    validity_penalty += 15
         else:
-            if start >= end:
-                deductions += 25
-            duration_delta = (end - start).total_seconds()
+            duration_delta = None
+
+        if rider_age_value is not None:
+            if not (16 <= rider_age_value <= 100):
+                validity_penalty += 20
+
+        def _penalize_station(value: Optional[float]) -> None:
+            nonlocal validity_penalty
+            if value is None:
+                return
             try:
-                provided_duration = float(row.get("trip_duration"))
+                station_id = int(value)
             except (TypeError, ValueError):
-                provided_duration = duration_delta
-            if abs(duration_delta - provided_duration) > 60:
-                deductions += 15
+                validity_penalty += 10
+                return
+            if stations and station_id not in stations:
+                validity_penalty += 10
 
-        age = row.get("rider_age")
-        if age is not None and not pd.isna(age):
-            if not (16 <= float(age) <= 100):
-                deductions += 20
+        _penalize_station(start_station_value)
+        _penalize_station(end_station_value)
+        validity_penalty = min(validity_penalty, VALIDITY_MAX_DEDUCTION)
 
-        for field in ("start_station_id", "end_station_id"):
-            station_value = row.get(field)
-            if station_value is None or pd.isna(station_value):
-                deductions += 10
-                continue
-            if stations and int(station_value) not in stations:
-                deductions += 10
-
-        duration_value = row.get("trip_duration")
-        if duration_value is not None and not pd.isna(duration_value):
-            duration_value = int(duration_value)
+        if duration_value is not None:
             if duration_value < MIN_TRIP_DURATION or duration_value > MAX_TRIP_DURATION:
-                deductions += 15
-            if start and end and row.get("start_station_id") == row.get("end_station_id"):
-                if duration_value > 3600:
-                    deductions += 5
+                business_penalty += 15
+            if (
+                start_station_value is not None
+                and end_station_value is not None
+                and int(start_station_value) == int(end_station_value)
+                and duration_value > 3600
+            ):
+                business_penalty += 5
+
         speed = _estimate_speed_kmh(row, stations)
         if speed and speed > MAX_SPEED_KMH:
-            deductions += 10
+            business_penalty += 10
+        business_penalty = min(business_penalty, BUSINESS_MAX_DEDUCTION)
 
-        score = max(BASE_SCORE - deductions, 0)
-        band = _score_band(score)
-        return score, deductions, band
+        total_deductions = schema_penalty + validity_penalty + business_penalty
+        normalized_score = max(BASE_SCORE - total_deductions, 0) / BASE_SCORE
+        band = _score_band(normalized_score * 100)
+        return (
+            round(normalized_score, 4),
+            round(total_deductions, 2),
+            band,
+            round(schema_penalty, 2),
+            round(validity_penalty, 2),
+            round(business_penalty, 2),
+        )
 
     scores = df.apply(
         lambda r: pd.Series(
-            _score_row(r), index=["quality_score", "deductions", "quality_band"]
+            _score_row(r),
+            index=[
+                "quality_score",
+                "deductions",
+                "quality_band",
+                "schema_penalty",
+                "validity_penalty",
+                "business_penalty",
+            ],
         ),
         axis=1,
     )
     scored_df = pd.concat([df, scores], axis=1)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    staging_key = f"staging/realtime_quality_{timestamp}.parquet"
+    staging_key = f"staging/{required_source_type or 'dataset'}_{timestamp}.parquet"
     staging_path = s3_uri(STORAGE_SETTINGS.silver_bucket, staging_key)
     scored_df.to_parquet(staging_path, index=False, storage_options=S3_OPTIONS)
 
+    total_records = len(scored_df)
     pass_rate = (
-        scored_df["quality_band"].isin(["EXCELLENT", "GOOD"]).sum() / len(scored_df)
+        scored_df["quality_band"].isin(["EXCELLENT", "GOOD"]).sum() / total_records
     ) * 100
+    poor_ratio = (
+        scored_df["quality_band"].eq("POOR").sum() / total_records if total_records else 0
+    )
+    band_counts = {
+        band: int(count) for band, count in scored_df["quality_band"].value_counts().items()
+    }
     metrics = {
-        "records": float(len(scored_df)),
+        "records": float(total_records),
         "quality_pass_rate": round(pass_rate, 2),
-        "poor_share": round(
-            scored_df["quality_band"].isin(["POOR"]).sum() / len(scored_df)
-            if len(scored_df)
-            else 0,
-            2,
-        ),
+        "poor_share": round(poor_ratio, 4),
         "staging_path": staging_path,
+        "quality_band_counts": band_counts,
+        "avg_quality_score": round(float(scored_df["quality_score"].mean()), 4),
+        "avg_deductions": round(float(scored_df["deductions"].mean()), 2),
+        "schema_penalty_avg": round(float(scored_df["schema_penalty"].mean()), 2),
+        "validity_penalty_avg": round(float(scored_df["validity_penalty"].mean()), 2),
+        "business_penalty_avg": round(float(scored_df["business_penalty"].mean()), 2),
+        "source_type": required_source_type or "mixed",
+        "evaluated_at": datetime.now(timezone.utc).isoformat(),
     }
     return staging_path, metrics
 
@@ -268,7 +445,9 @@ def promote_to_silver(staging_path: str) -> str:
     if df.empty:
         return ""
 
-    df["start_time"] = pd.to_datetime(df["start_time"], utc=True)
+    df["start_time"] = pd.to_datetime(
+        df["start_time"], utc=True, errors="coerce", format="ISO8601"
+    )
     df["date"] = df["start_time"].dt.strftime("%Y-%m-%d")
     df["hour"] = df["start_time"].dt.strftime("%H")
 
@@ -294,20 +473,35 @@ def update_gold_tables(silver_file: str) -> Dict[str, str]:
         return {}
 
     df["start_time"] = pd.to_datetime(df["start_time"], utc=True)
+    df["source_type"] = df.get("source_type", "unknown")
+
+    def _upsert(path: str, new_df: pd.DataFrame, index_cols: List[str]) -> None:
+        try:
+            existing = pd.read_parquet(path, storage_options=S3_OPTIONS)
+        except FileNotFoundError:
+            existing = pd.DataFrame(columns=new_df.columns)
+        combined = pd.concat([existing, new_df], ignore_index=True)
+        combined = (
+            combined.sort_values(index_cols)
+            .drop_duplicates(subset=index_cols, keep="last")
+            .reset_index(drop=True)
+        )
+        combined.to_parquet(path, index=False, storage_options=S3_OPTIONS)
+
     station_status = (
-        df.groupby("start_station_id")
+        df.groupby(["source_type", "start_station_id"])
         .agg(trips_started=("trip_id", "count"), avg_quality=("quality_score", "mean"))
         .reset_index()
     )
     hourly_usage = (
         df.assign(hour=df["start_time"].dt.floor("H"))
-        .groupby("hour")
+        .groupby(["source_type", "hour"])
         .agg(trips=("trip_id", "count"), avg_quality=("quality_score", "mean"))
         .reset_index()
     )
     quality_trend = (
         df.assign(date=df["start_time"].dt.date)
-        .groupby("date")
+        .groupby(["source_type", "date"])
         .agg(
             mean_quality=("quality_score", "mean"),
             poor_share=("quality_band", lambda x: (x == "POOR").mean()),
@@ -319,9 +513,9 @@ def update_gold_tables(silver_file: str) -> Dict[str, str]:
     hourly_usage_path = s3_uri(STORAGE_SETTINGS.gold_bucket, "hourly_usage.parquet")
     trend_path = s3_uri(STORAGE_SETTINGS.gold_bucket, "quality_trends.parquet")
 
-    station_status.to_parquet(station_status_path, index=False, storage_options=S3_OPTIONS)
-    hourly_usage.to_parquet(hourly_usage_path, index=False, storage_options=S3_OPTIONS)
-    quality_trend.to_parquet(trend_path, index=False, storage_options=S3_OPTIONS)
+    _upsert(station_status_path, station_status, ["source_type", "start_station_id"])
+    _upsert(hourly_usage_path, hourly_usage, ["source_type", "hour"])
+    _upsert(trend_path, quality_trend, ["source_type", "date"])
 
     return {
         "station_status": station_status_path,
@@ -338,6 +532,12 @@ def create_quality_report(metrics: Dict[str, float]) -> str:
         "records": metrics.get("records", 0),
         "quality_pass_rate": metrics.get("quality_pass_rate", 0),
         "poor_share": metrics.get("poor_share", 0),
+        "avg_quality_score": metrics.get("avg_quality_score"),
+        "band_counts": metrics.get("quality_band_counts", {}),
+        "schema_penalty_avg": metrics.get("schema_penalty_avg"),
+        "validity_penalty_avg": metrics.get("validity_penalty_avg"),
+        "business_penalty_avg": metrics.get("business_penalty_avg"),
+        "source_type": metrics.get("source_type"),
         "status": "healthy" if metrics.get("poor_share", 0) <= 0.2 else "attention",
     }
     with S3_FS.open(report_path, "w") as handle:
